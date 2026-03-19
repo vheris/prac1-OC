@@ -28,4 +28,4 @@ $(APP_NAME): main.c
 	$(CC) -Wall -pthread main.c -o $(APP_NAME) -ldl
 
 clean:
-	rm -f *.o *.so *.dylib $(APP_NAME) *.tmp
+	rm -f *.o *.so *.dylib $(APP_NAME) log.txt

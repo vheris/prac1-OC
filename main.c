@@ -4,6 +4,11 @@
 #include <signal.h>
 #include <pthread.h>
 #include <string.h>
+#include <time.h> // измерение длительности
+#include <errno.h> // коды сист. ошиб.
+#include <sys/stat.h> // проверка сущ дир. и создание
+#include <libgen.h> // получение имени файла
+
 
 typedef void (*set_key_func)(char);
 typedef void (*caesar_func)(void*, void*, int);
@@ -16,147 +21,134 @@ static void handler(int signo) {
 }
 
 #define BLOCK_SIZE 8192
-#define Q_CAP 4
 
 typedef struct {
-    unsigned char data[Q_CAP][BLOCK_SIZE];
-    size_t len[Q_CAP];
-    int head;
-    int tail;
-    int count;
-
-    int done;
-    int prod_error;  // ошибка чтения
-    int cons_error;  // ошибка записи
-
-    pthread_mutex_t m;
-    pthread_cond_t not_full;
-    pthread_cond_t not_empty;
-} queue_t;
-
-typedef struct {
-    FILE* in;
-    FILE* out;
+    char** files;
+    int total_files;
+    int current_idx;
+    int copied_count;       
+    
+    const char* out_dir;
     caesar_func caesar;
-    queue_t q;
+    pthread_mutex_t counter_mutex;
 } shared_t;
-
-static void queue_init(queue_t* q) {
-    memset(q, 0, sizeof(*q));
-    pthread_mutex_init(&q->m, NULL);
-    pthread_cond_init(&q->not_full, NULL);
-    pthread_cond_init(&q->not_empty, NULL);
-}
-
-static void queue_destroy(queue_t* q) {
-    pthread_cond_destroy(&q->not_empty);
-    pthread_cond_destroy(&q->not_full);
-    pthread_mutex_destroy(&q->m);
-}
 
 static void* producer_thread(void* arg) {
     shared_t* sh = (shared_t*)arg;
-    queue_t* q = &sh->q;
 
     while (keep_running) {
-        unsigned char tmp[BLOCK_SIZE];
-        size_t rd = fread(tmp, 1, BLOCK_SIZE, sh->in);
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += 5;
 
-        if (rd == 0) {
-            pthread_mutex_lock(&q->m);
-            if (ferror(sh->in)) q->prod_error = 1;
-            q->done = 1;
-            pthread_cond_broadcast(&q->not_empty);
-            pthread_mutex_unlock(&q->m);
+        int lock_res = pthread_mutex_timedlock(&sh->counter_mutex, &ts);
+        if (lock_res == ETIMEDOUT) {
+            fprintf(stderr, "Поток ожидает мьютекс более 5 секунд\n");
+            continue; 
+        } else if (lock_res != 0) {
             return NULL;
         }
 
-        sh->caesar(tmp, tmp, (int)rd);
-
-        pthread_mutex_lock(&q->m);
-        while (q->count == Q_CAP && keep_running) {
-            pthread_cond_wait(&q->not_full, &q->m);
+        if (sh->current_idx >= sh->total_files) {
+            pthread_mutex_unlock(&sh->counter_mutex);
+            break; 
         }
+        
+        int my_idx = sh->current_idx++;
+        pthread_mutex_unlock(&sh->counter_mutex);
 
-        if (!keep_running) {
-            q->done = 1;
-            pthread_cond_broadcast(&q->not_empty);
-            pthread_mutex_unlock(&q->m);
-            return NULL;
-        }
+        char* input_path = sh->files[my_idx];
+        char path_copy[1024];
+        strncpy(path_copy, input_path, sizeof(path_copy));
+        char* fname = basename(path_copy);
 
-        memcpy(q->data[q->tail], tmp, rd);
-        q->len[q->tail] = rd;
-        q->tail = (q->tail + 1) % Q_CAP;
-        q->count++;
+        char output_path[2048];
+        snprintf(output_path, sizeof(output_path), "%s/%s", sh->out_dir, fname);
 
-        pthread_cond_signal(&q->not_empty);
-        pthread_mutex_unlock(&q->m);
-    }
+        int success = 1;
+        struct timespec start, end;
+        clock_gettime(CLOCK_MONOTONIC, &start);
 
-    pthread_mutex_lock(&q->m);
-    q->done = 1;
-    pthread_cond_broadcast(&q->not_empty);
-    pthread_mutex_unlock(&q->m);
-    return NULL;
-}
-
-static void* consumer_thread(void* arg) {
-    shared_t* sh = (shared_t*)arg;
-    queue_t* q = &sh->q;
-
-    while (keep_running) {
-        unsigned char tmp[BLOCK_SIZE];
-        size_t len = 0;
-        int done = 0;
-
-        pthread_mutex_lock(&q->m);
-
-        while (q->count == 0 && !q->done && keep_running) {
-            pthread_cond_wait(&q->not_empty, &q->m);
-        }
-
-        if (q->count > 0) {
-            len = q->len[q->head];
-            memcpy(tmp, q->data[q->head], len);
-            q->head = (q->head + 1) % Q_CAP;
-            q->count--;
-            pthread_cond_signal(&q->not_full);
-        }
-
-        done = q->done;
-
-        pthread_mutex_unlock(&q->m);
-
-        if (len > 0) {
-            size_t wr = fwrite(tmp, 1, len, sh->out);
-            if (wr != len) {
-                pthread_mutex_lock(&q->m);
-                q->cons_error = 1;
-                q->done = 1;
-                pthread_cond_broadcast(&q->not_full);
-                pthread_mutex_unlock(&q->m);
-                return NULL;
+        FILE* in = fopen(input_path, "rb");
+        FILE* out = NULL;
+        if (in) {
+            out = fopen(output_path, "wb");
+            if (out) {
+                unsigned char tmp[BLOCK_SIZE];
+                size_t rd;
+                while ((rd = fread(tmp, 1, BLOCK_SIZE, in)) > 0) {
+                    sh->caesar(tmp, tmp, (int)rd);
+                    if (fwrite(tmp, 1, rd, out) != rd) {
+                        success = 0;
+                        break;
+                    }
+                }
+                if (ferror(in)) success = 0;
+                fclose(out);
+            } else {
+                success = 0;
             }
-        } else if (done) {
-            return NULL;
+            fclose(in);
+        } else {
+            success = 0;
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+
+        int log_locked = 0;
+        while (keep_running && !log_locked) {
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_sec += 5;
+            
+            lock_res = pthread_mutex_timedlock(&sh->counter_mutex, &ts);
+            
+            if (lock_res == ETIMEDOUT) {
+                fprintf(stderr, "Возможная взаимоблокировка: поток %lu ожидает мьютекс более 5 секунд (запись лога)\n", (unsigned long)pthread_self()); // [cite: 16]
+                continue; 
+            } else if (lock_res == 0) {
+                log_locked = 1; 
+                
+                if (success) {
+                    sh->copied_count++;
+                }
+
+                FILE* log_file = fopen("log.txt", "a");
+                if (log_file) {
+                    time_t now = time(NULL);
+                    char time_str[64];
+                    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", localtime(&now));
+                    
+                    fprintf(log_file, "[%s] Thread: %lu, File: %s, Result: %s, Time: %.4f s\n",
+                            time_str, (unsigned long)pthread_self(), fname, success ? "SUCCESS" : "ERROR", elapsed);
+                    fclose(log_file);
+                }
+                pthread_mutex_unlock(&sh->counter_mutex); 
+            } else {
+                break; 
+            }
         }
     }
-
     return NULL;
 }
 
 int main(int argc, char* argv[]) { //принимает кол-во аргументов ком. строки и сами аргументы
     signal(SIGINT, handler);
     
-    if (argc != 4){
-            fprintf(stderr, "Usage: %s <input.txt> <output.txt> <key>\n", argv[0]);
+    if (argc < 4){
+            fprintf(stderr, "Usage: %s <input.txt> [input2.txt...] <output_dir/> <key>\n", argv[0]);
             return 1;
         }
 
-    const char* input_path = argv[1];
-    const char* output_path = argv[2];
-    char key = argv[3][0];
+    int total_files = argc - 3;
+    const char* out_dir = argv[argc - 2];
+    char key = argv[argc - 1][0];
+
+    struct stat st = {0};
+    if (stat(out_dir, &st) == -1) {
+        mkdir(out_dir, 0755);
+    }
+
 
     #if defined(__APPLE__)
         const char* lib_path = "./libcaesar.dylib";
@@ -164,20 +156,19 @@ int main(int argc, char* argv[]) { //принимает кол-во аргуме
         const char* lib_path = "./libcaesar.so";
     #endif
 
-    char tmp_path[4096];
-    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", output_path);
-
-    FILE* in = NULL;
-    FILE* out = NULL;
-    void* handle = NULL;
-
-    pthread_t prod, cons;
+    pthread_t threads[3]; 
     int threads_started = 0;
+    void* handle = NULL;
 
     shared_t sh;
     memset(&sh, 0, sizeof(sh));
-    queue_init(&sh.q);
-        
+    sh.files = &argv[1];
+    sh.total_files = total_files;
+    sh.out_dir = out_dir;
+    
+    pthread_mutex_t init_mutex = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_init(&sh.counter_mutex, NULL);
+
     handle = dlopen(lib_path, RTLD_LAZY);
     if (!handle) {
         fprintf(stderr, "dlopen error: %s\n", dlerror());
@@ -189,97 +180,37 @@ int main(int argc, char* argv[]) { //принимает кол-во аргуме
 
     if (!set_key || !caesar) {
         fprintf(stderr, "dlsym error\n");
-        dlclose(handle);
-        goto cleanup;
-    }
-
-    in = fopen(input_path, "rb");
-    if (!in) {
-        perror("fopen input");
-        goto cleanup;
-    }
-
-    out = fopen(tmp_path, "wb");
-    if (!out) {
-        perror("fopen output");
         goto cleanup;
     }
 
     set_key(key);
-
-    sh.in = in;
-    sh.out = out;
     sh.caesar = caesar;
 
-    if (pthread_create(&prod, NULL, producer_thread, &sh) != 0) {
-        fprintf(stderr, "pthread_create producer error\n");
-        goto cleanup;
-    }
-    if (pthread_create(&cons, NULL, consumer_thread, &sh) != 0) {
-        fprintf(stderr, "pthread_create consumer error\n");
-        keep_running = 0;
-        pthread_join(prod, NULL);
-        goto cleanup;
+    for (int i = 0; i < 3; i++){
+        if (pthread_create(&threads[i], NULL, producer_thread, &sh) != 0) {
+            fprintf(stderr, "pthread_create error\n");
+            keep_running = 0;
+            goto cleanup;
+        }
     }
     threads_started = 1;
 
-    pthread_join(prod, NULL);
-    pthread_join(cons, NULL);
+    for (int i = 0; i < 3; i++) {
+        pthread_join(threads[i], NULL);
+    }
 
     if (!keep_running) {
         fprintf(stderr, "Операция прервана пользователем\n");
-        goto cleanup;
     }
-
-    if (sh.q.prod_error || sh.q.cons_error) {
-        fprintf(stderr, "I/O error\n");
-        goto cleanup;
-    }
-
-    if (fflush(out) != 0) {
-        perror("fflush");
-        goto cleanup;
-    }
-
-    fclose(out);
-    out = NULL;
-
-    if (rename(tmp_path, output_path) != 0) {
-        perror("rename");
-        goto cleanup;
-    }
-
-    fclose(in);
-    in = NULL;
-
-    dlclose(handle);
-    handle = NULL;
-
-    queue_destroy(&sh.q);
-    return 0;
 
 cleanup:
-    pthread_mutex_lock(&sh.q.m);
-    sh.q.done = 1;
-    pthread_cond_broadcast(&sh.q.not_empty);
-    pthread_cond_broadcast(&sh.q.not_full);
-    pthread_mutex_unlock(&sh.q.m);
-
-    if (threads_started) {
-        pthread_join(prod, NULL);
-        pthread_join(cons, NULL);
+    if (threads_started && keep_running == 0) {
+        for (int i = 0; i < 3; i++) {
+            pthread_join(threads[i], NULL);
+        }
     }
 
-    if (!keep_running) {
-        fprintf(stderr, "Операция прервана пользователем\n");
-    }
-
-    if (out) fclose(out);
-    if (in) fclose(in);
     if (handle) dlclose(handle);
-
-    remove(tmp_path);
-
-    queue_destroy(&sh.q);
+    pthread_mutex_destroy(&sh.counter_mutex);
     return 0;
 }
