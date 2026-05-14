@@ -8,9 +8,12 @@
 #include <errno.h> // коды сист. ошиб.
 #include <sys/stat.h> // проверка сущ дир. и создание
 #include <libgen.h> // получение имени файла
+#include <sys/mman.h>
+#include <unistd.h>
 
+#define KEYLEN 16
 
-typedef void (*set_key_func)(char);
+typedef void (*set_key_ptr_func)(void*);
 typedef void (*caesar_func)(void*, void*, int);
 
 static volatile sig_atomic_t keep_running = 1;
@@ -18,6 +21,13 @@ static volatile sig_atomic_t keep_running = 1;
 static void handler(int signo) {
     (void)signo;
     keep_running = 0;
+}
+
+
+static void key_sigsegv_handler(int sig, siginfo_t* info, void* ctx) {
+    (void)sig; (void)info; (void)ctx;
+    fprintf(stderr, "Попытка записи в защищённую память ключа!\n");
+    _exit(111); // Завершаем с ненулевым кодом
 }
 
 #define BLOCK_SIZE 8192
@@ -217,6 +227,16 @@ int main(int argc, char* argv[]) { //принимает кол-во аргуме
     void* handle = NULL;
     int mutex_inited = 0;
 
+    void* key_mem = NULL;
+
+    struct sigaction sa = {0};
+
+    //устанавливаем обработчик SIGSEGV
+    sa.sa_sigaction = key_sigsegv_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+
     if (argc > 1 && strncmp(argv[1], "--mode=", 7) == 0) {
         if (parse_mode(argv[1] + 7, &mode) != 0) {
             fprintf(stderr, "Unknown mode: %s\n", argv[1] + 7);
@@ -232,7 +252,23 @@ int main(int argc, char* argv[]) { //принимает кол-во аргуме
 
     int total_files = (argc - argi) - 2;
     const char* out_dir = argv[argc - 2];
-    char key = argv[argc - 1][0];
+
+
+    key_mem = mmap(NULL, KEYLEN, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (key_mem == MAP_FAILED) {
+        perror("mmap failed");
+        exit(2);
+    }
+    memset(key_mem, 0, KEYLEN);
+    size_t key_len = strlen(argv[argc - 1]);
+    if (key_len > KEYLEN) key_len = KEYLEN;
+    memcpy(key_mem, argv[argc - 1], key_len); // запись ключа
+    
+    // Блокируем доступ сразу
+    if (mprotect(key_mem, KEYLEN, PROT_NONE) != 0) {
+        perror("mprotect after key write");
+        exit(3);
+    }
 
     struct stat st = {0};
     if (stat(out_dir, &st) == -1) {
@@ -251,15 +287,21 @@ int main(int argc, char* argv[]) { //принимает кол-во аргуме
         goto cleanup;
     }
 
-    set_key_func set_key = (set_key_func)dlsym(handle, "set_key"); // получаем адреса функций
+    set_key_ptr_func set_key_ptr = (set_key_ptr_func)dlsym(handle, "set_key_ptr"); // получаем адреса функций
     caesar_func caesar = (caesar_func)dlsym(handle, "caesar");
 
-    if (!set_key || !caesar) {
+    if (!set_key_ptr || !caesar) {
         fprintf(stderr, "dlsym error\n");
         goto cleanup;
     }
+    
+    // передаем библиотеке указатель
+    set_key_ptr(key_mem);
 
-    set_key(key);
+    #ifdef DEMO_SEGV
+        fprintf(stderr, "Попытка записи в ключевую память...\n");
+        ((char*)key_mem)[0] = 'R'; // должна быть ошибка и завершение
+    #endif
 
     shared_t sh;
     memset(&sh, 0, sizeof(sh));
@@ -296,5 +338,10 @@ int main(int argc, char* argv[]) { //принимает кол-во аргуме
 cleanup:
     if (handle) dlclose(handle);
     if (mutex_inited) pthread_mutex_destroy(&sh.counter_mutex);
+    if (key_mem) {
+        mprotect(key_mem, KEYLEN, PROT_READ | PROT_WRITE);
+        memset(key_mem, 0, KEYLEN);
+        munmap(key_mem, KEYLEN);
+    }
     return 0;
 }

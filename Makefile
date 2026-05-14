@@ -1,3 +1,5 @@
+.DEFAULT_GOAL := all
+
 CC = gcc
 CFLAGS = -Wall -Wextra -pedantic -fPIC
 LDFLAGS = -ldl -pthread
@@ -16,7 +18,10 @@ endif
 
 LIB_NAME = libcaesar.$(LIB_EXT)
 APP_NAME = secure_copy
+APP_DEMO = secure_copy_demo
 OUT_DIR = out
+
+.PHONY: all demo clean test-files test test-seq test-par
 
 all: $(LIB_NAME) $(APP_NAME)
 
@@ -26,11 +31,16 @@ $(LIB_NAME): libcaesar.o
 libcaesar.o: libcaesar.c libcaesar.h
 	$(CC) $(CFLAGS) -c libcaesar.c
 
-$(APP_NAME): main.c
+$(APP_NAME): main.c libcaesar.h $(LIB_NAME)
 	$(CC) $(CFLAGS) main.c -o $@ $(LDFLAGS)
 
+$(APP_DEMO): main.c libcaesar.h $(LIB_NAME)
+	$(CC) $(CFLAGS) -DDEMO_SEGV main.c -o $@ $(LDFLAGS)
+
+demo: $(LIB_NAME) $(APP_DEMO)
+
 clean:
-	rm -f *.o *.so *.dylib $(APP_NAME) log.txt f*.txt a.txt b.txt c.txt d.txt
+	rm -f *.o *.so *.dylib $(APP_NAME) $(APP_DEMO) log.txt f*.txt a.txt b.txt c.txt d.txt
 	rm -rf $(OUT_DIR)
 
 test-files:
