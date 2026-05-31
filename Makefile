@@ -9,6 +9,7 @@ UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Linux)
   LIB_EXT = so
   SHARED_FLAGS = -shared
+  CFLAGS += -D_XOPEN_SOURCE=500
 endif
 
 ifeq ($(UNAME_S),Darwin)
@@ -16,7 +17,7 @@ ifeq ($(UNAME_S),Darwin)
   SHARED_FLAGS = -dynamiclib
 endif
 
-LIB_NAME = libcaesar.$(LIB_EXT)
+LIB_NAME = librc4.$(LIB_EXT)
 APP_NAME = secure_copy
 APP_DEMO = secure_copy_demo
 OUT_DIR = out
@@ -25,22 +26,22 @@ OUT_DIR = out
 
 all: $(LIB_NAME) $(APP_NAME)
 
-$(LIB_NAME): libcaesar.o
+$(LIB_NAME): librc4.o
 	$(CC) $(SHARED_FLAGS) -o $@ $^
 
-libcaesar.o: libcaesar.c libcaesar.h
-	$(CC) $(CFLAGS) -c libcaesar.c
+librc4.o: librc4.c librc4.h
+	$(CC) $(CFLAGS) -c librc4.c
 
-$(APP_NAME): main.c libcaesar.h $(LIB_NAME)
+$(APP_NAME): main.c librc4.h $(LIB_NAME)
 	$(CC) $(CFLAGS) main.c -o $@ $(LDFLAGS)
 
-$(APP_DEMO): main.c libcaesar.h $(LIB_NAME)
+$(APP_DEMO): main.c librc4.h $(LIB_NAME)
 	$(CC) $(CFLAGS) -DDEMO_SEGV main.c -o $@ $(LDFLAGS)
 
 demo: $(LIB_NAME) $(APP_DEMO)
 
 clean:
-	rm -f *.o *.so *.dylib $(APP_NAME) $(APP_DEMO) log.txt f*.txt a.txt b.txt c.txt d.txt
+	rm -f *.o *.so *.dylib $(APP_NAME) $(APP_DEMO) log.txt f*.txt a.txt b.txt c.txt d.txt img_f*.txt extracted_*.txt *.img
 	rm -rf $(OUT_DIR)
 
 test-files:
